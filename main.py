@@ -42,6 +42,7 @@ class EjercicioPlantilla(BaseModel):
     nombre: str
     series_objetivo: int
     reps_objetivo: str
+    descanso_objetivo: Optional[str] = ""
     notas_default: Optional[str] = ""
 
 class DiaRutina(BaseModel):
