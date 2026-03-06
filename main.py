@@ -1,5 +1,6 @@
 import os
 import json
+from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
 from fastapi import FastAPI, HTTPException, Header, Body
 from pydantic import BaseModel
@@ -44,6 +45,7 @@ class EjercicioPlantilla(BaseModel):
     reps_objetivo: str
     descanso_objetivo: Optional[str] = ""
     notas_default: Optional[str] = ""
+    tipo_medida: Optional[str] = "reps"  # "reps", "segundos", "metros", "minutos"
 
 class DiaRutina(BaseModel):
     dia_semana: str 
@@ -157,3 +159,76 @@ async def delete_routine_day(usuario: str, dia_semana: str, x_api_key: str = Hea
     ref.delete()
     
     return {"status": "deleted", "target": f"Plantilla {dia_semana}"}
+
+# 6. Obtener registros previos de ejercicios (POST)
+class PreviousRecordsRequest(BaseModel):
+    exercise_names: List[str]
+    before_date: str
+    days_back: int = 14
+
+@app.post("/{usuario}/registros_previos")
+async def get_previous_records(usuario: str, payload: PreviousRecordsRequest, x_api_key: str = Header(None)):
+    verify_key(x_api_key)
+
+    ref = db.reference(f'/usuarios/{usuario}/historial')
+    historial = ref.get() or {}
+
+    try:
+        target_date = datetime.strptime(payload.before_date, "%Y-%m-%d")
+        start_date = target_date - timedelta(days=payload.days_back)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Formato de fecha inválido (YYYY-MM-DD)")
+
+    results = {}
+    for name in payload.exercise_names:
+        normalized = name.strip().lower()
+        best_weight = 0.0
+        best_info = ""
+        best_date = ""
+
+        for fecha, datos in historial.items():
+            try:
+                workout_date = datetime.strptime(fecha, "%Y-%m-%d")
+                if workout_date < start_date or workout_date >= target_date:
+                    continue
+            except ValueError:
+                continue
+
+            rutina = datos.get("rutina_realizada", [])
+            if isinstance(rutina, list):
+                for ej in rutina:
+                    if not isinstance(ej, dict):
+                        continue
+                    ej_name = ej.get("ejercicio", "").strip().lower()
+                    if ej_name == normalized:
+                        series = ej.get("series_realizadas", [])
+                        if isinstance(series, list):
+                            for s in series:
+                                if not isinstance(s, dict):
+                                    continue
+                                kg = float(s.get("kg", 0))
+                                if kg > best_weight:
+                                    best_weight = kg
+                                    unidad = s.get("unidad", "reps")
+                                    valor = s.get("valor", "")
+                                    reps = s.get("reps", 0)
+                                    if unidad != "reps" and valor:
+                                        best_info = f"{kg}kg × {valor} {unidad}"
+                                    else:
+                                        best_info = f"{kg}kg × {reps} reps"
+                                    best_date = fecha
+
+                        peso_max = float(ej.get("peso_max", 0))
+                        if peso_max > best_weight:
+                            best_weight = peso_max
+                            best_info = f"{peso_max}kg (máx registrado)"
+                            best_date = fecha
+
+        if best_weight > 0:
+            results[name] = {
+                "max_weight": best_weight,
+                "best_series_info": best_info,
+                "date": best_date
+            }
+
+    return {"status": "success", "records": results}
