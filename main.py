@@ -13,19 +13,16 @@ load_dotenv()
 
 # 2. Configuración de Firebase (Compatible con Render y Local)
 if not firebase_admin._apps:
-    # Intentamos leer el contenido del JSON desde la variable de entorno (Render)
     firebase_json_content = os.getenv("FIREBASE_CREDENTIALS")
     
     if firebase_json_content:
         try:
-            # Parseamos el string JSON a un diccionario
             cred_dict = json.loads(firebase_json_content)
             cred = credentials.Certificate(cred_dict)
         except json.JSONDecodeError:
             print("Error: La variable FIREBASE_CREDENTIALS no es un JSON válido.")
             raise
     else:
-        # Si no hay variable, buscamos el archivo físico (Local)
         if os.path.exists("serviceAccountKey.json"):
             cred = credentials.Certificate("serviceAccountKey.json")
         else:
@@ -45,7 +42,7 @@ class EjercicioPlantilla(BaseModel):
     reps_objetivo: str
     descanso_objetivo: Optional[str] = ""
     notas_default: Optional[str] = ""
-    tipo_medida: Optional[str] = "reps"  # "reps", "segundos", "metros", "minutos"
+    tipo_medida: Optional[str] = "reps"
 
 class DiaRutina(BaseModel):
     dia_semana: str 
@@ -58,119 +55,244 @@ class LogDiaRequest(BaseModel):
     fecha: str
     datos: Dict[str, Any]
 
-# --- SEGURIDAD ---
+class RegisterUserRequest(BaseModel):
+    telefono: str
+    nombre: str
 
-def verify_key(x_api_key: str):
-    # La clave debe estar en las variables de entorno de Render
-    env_key = os.getenv("API_KEY")
-    if not env_key:
-        raise HTTPException(status_code=500, detail="Error de config: API_KEY no establecida en el servidor")
-        
-    if x_api_key != env_key:
-        raise HTTPException(status_code=403, detail="Acceso denegado: Clave incorrecta")
+class ClaimLegacyRequest(BaseModel):
+    telefono: str
+    legacy_username: str
 
-# --- RUTAS DE LA API ---
-
-@app.get("/")
-def home():
-    return {"status": "online", "mode": "Gym Bros API"}
-
-# Endpoint para Cronjob (Evita que Render se duerma)
-@app.get("/ping")
-def keep_alive():
-    return {"status": "alive", "message": "Server is running"}
-
-# 1. Sincronización Total (GET)
-@app.get("/sync/{usuario}")
-async def sync_all(usuario: str, x_api_key: str = Header(None)):
-    verify_key(x_api_key)
-    
-    if usuario not in ["enrique", "oscar"]:
-        raise HTTPException(status_code=400, detail="Usuario desconocido")
-    
-    amigo = "oscar" if usuario == "enrique" else "enrique"
-
-    # Referencias a la base de datos
-    ref_usuario = db.reference(f'/usuarios/{usuario}')
-    ref_amigo = db.reference(f'/usuarios/{amigo}')
-
-    # Obtenemos los datos (o diccionarios vacíos si no existen)
-    datos_usuario = ref_usuario.get() or {}
-    datos_amigo = ref_amigo.get() or {}
-
-    return {
-        "mi_perfil": {
-            "rutina_actual": datos_usuario.get("rutina_actual", {}),
-            "historial": datos_usuario.get("historial", {})
-        },
-        "perfil_amigo": {
-            "rutina_actual": datos_amigo.get("rutina_actual", {}),
-            "historial": datos_amigo.get("historial", {})
-        }
-    }
-
-# 2. Definir Rutina / Plantilla (POST)
-@app.post("/{usuario}/definir_rutina")
-async def set_routine(usuario: str, payload: UpdateRutinaRequest, x_api_key: str = Header(None)):
-    verify_key(x_api_key)
-    
-    ref = db.reference(f'/usuarios/{usuario}/rutina_actual')
-    # Convertimos los modelos a diccionario para que Firebase los acepte
-    datos_dict = {k: v.dict() for k, v in payload.dias.items()}
-    ref.update(datos_dict)
-
-    return {"status": "success", "message": "Plantilla de rutina actualizada"}
-
-# 3. Guardar Día / Historial (POST)
-@app.post("/{usuario}/guardar_dia")
-async def save_day(usuario: str, payload: LogDiaRequest, x_api_key: str = Header(None)):
-    verify_key(x_api_key)
-
-    # Guardamos en el nodo 'historial' bajo la fecha específica
-    ref = db.reference(f'/usuarios/{usuario}/historial/{payload.fecha}')
-    ref.set(payload.datos)
-
-    # Opcional: Devolver datos del amigo actualizados
-    amigo = "oscar" if usuario == "enrique" else "enrique"
-    datos_amigo_historial = db.reference(f'/usuarios/{amigo}/historial').get()
-
-    return {
-        "status": "success", 
-        "message": f"Día {payload.fecha} guardado exitosamente",
-        "friend_updates": datos_amigo_historial
-    }
-
-# 4. Borrar Día del Historial (DELETE)
-@app.delete("/{usuario}/historial/{fecha}")
-async def delete_history_day(usuario: str, fecha: str, x_api_key: str = Header(None)):
-    verify_key(x_api_key)
-    
-    ref = db.reference(f'/usuarios/{usuario}/historial/{fecha}')
-    ref.delete()
-    
-    return {"status": "deleted", "target": f"Historial {fecha}"}
-
-# 5. Borrar Día de la Plantilla (DELETE)
-@app.delete("/{usuario}/rutina/{dia_semana}")
-async def delete_routine_day(usuario: str, dia_semana: str, x_api_key: str = Header(None)):
-    verify_key(x_api_key)
-    
-    ref = db.reference(f'/usuarios/{usuario}/rutina_actual/{dia_semana}')
-    ref.delete()
-    
-    return {"status": "deleted", "target": f"Plantilla {dia_semana}"}
-
-# 6. Obtener registros previos de ejercicios (POST)
 class PreviousRecordsRequest(BaseModel):
     exercise_names: List[str]
     before_date: str
     days_back: int = 14
 
+# --- SEGURIDAD ---
+
+def verify_key(x_api_key: str):
+    env_key = os.getenv("API_KEY")
+    if not env_key:
+        raise HTTPException(status_code=500, detail="Error de config: API_KEY no establecida en el servidor")
+    if x_api_key != env_key:
+        raise HTTPException(status_code=403, detail="Acceso denegado: Clave incorrecta")
+
+# --- HELPERS ---
+
+def sanitize_phone(phone: str) -> str:
+    """Sanitiza un teléfono dejando solo dígitos"""
+    return ''.join(c for c in phone.strip() if c.isdigit())
+
+def resolve_data_path(usuario: str) -> str:
+    """Resuelve un ID de usuario (teléfono o nombre legacy) a su ruta de datos en Firebase"""
+    reg = db.reference(f'/users_registry/{usuario}').get()
+    if reg:
+        return reg.get('data_path', usuario)
+    if usuario in ['enrique', 'oscar']:
+        return usuario
+    return usuario
+
+def get_all_registered_users() -> list:
+    """Obtiene todos los usuarios registrados + usuarios legacy sin reclamar"""
+    registry = db.reference('/users_registry').get() or {}
+    
+    users = []
+    claimed_legacy = set()
+    
+    for phone, data in registry.items():
+        users.append({
+            "telefono": data.get("telefono", phone),
+            "nombre": data.get("nombre", ""),
+            "data_path": data.get("data_path", phone),
+            "necesita_telefono": False,
+            "legacy_username": data.get("legacy_username", "")
+        })
+        if data.get("legacy_username"):
+            claimed_legacy.add(data["legacy_username"])
+    
+    for legacy_user in ["enrique", "oscar"]:
+        if legacy_user not in claimed_legacy:
+            ref = db.reference(f'/usuarios/{legacy_user}')
+            if ref.get() is not None:
+                users.append({
+                    "telefono": "",
+                    "nombre": legacy_user.capitalize(),
+                    "data_path": legacy_user,
+                    "necesita_telefono": True,
+                    "legacy_username": legacy_user
+                })
+    
+    return users
+
+# --- RUTAS DE LA API ---
+
+@app.get("/")
+def home():
+    return {"status": "online", "mode": "Gym Bros API v2"}
+
+@app.get("/ping")
+def keep_alive():
+    return {"status": "alive", "message": "Server is running"}
+
+# --- GESTIÓN DE USUARIOS ---
+
+@app.get("/usuarios_registrados")
+async def list_users(x_api_key: str = Header(None)):
+    verify_key(x_api_key)
+    users = get_all_registered_users()
+    return {"status": "success", "usuarios": users}
+
+@app.post("/registrar")
+async def register_user(payload: RegisterUserRequest, x_api_key: str = Header(None)):
+    verify_key(x_api_key)
+    phone = sanitize_phone(payload.telefono)
+    nombre = payload.nombre.strip()
+    
+    if not phone or not nombre:
+        raise HTTPException(status_code=400, detail="Teléfono y nombre son obligatorios")
+    
+    reg_ref = db.reference(f'/users_registry/{phone}')
+    if reg_ref.get():
+        raise HTTPException(status_code=400, detail="Este teléfono ya está registrado")
+    
+    reg_ref.set({
+        "nombre": nombre,
+        "telefono": phone,
+        "data_path": phone
+    })
+    
+    db.reference(f'/usuarios/{phone}').set({
+        "rutina_actual": {},
+        "historial": {}
+    })
+    
+    return {"status": "success", "usuario_id": phone, "data_path": phone, "nombre": nombre}
+
+@app.post("/reclamar_legacy")
+async def claim_legacy(payload: ClaimLegacyRequest, x_api_key: str = Header(None)):
+    verify_key(x_api_key)
+    phone = sanitize_phone(payload.telefono)
+    legacy = payload.legacy_username.strip().lower()
+    
+    if not phone:
+        raise HTTPException(status_code=400, detail="Teléfono es obligatorio")
+    
+    if legacy not in ["enrique", "oscar"]:
+        raise HTTPException(status_code=400, detail="Usuario legacy no válido")
+    
+    reg_ref = db.reference(f'/users_registry/{phone}')
+    if reg_ref.get():
+        raise HTTPException(status_code=400, detail="Este teléfono ya está registrado")
+    
+    registry = db.reference('/users_registry').get() or {}
+    for p, data in registry.items():
+        if data.get("legacy_username") == legacy:
+            raise HTTPException(status_code=400, detail=f"El usuario {legacy} ya fue reclamado por otro teléfono")
+    
+    reg_ref.set({
+        "nombre": legacy.capitalize(),
+        "telefono": phone,
+        "data_path": legacy,
+        "legacy_username": legacy
+    })
+    
+    return {"status": "success", "usuario_id": phone, "data_path": legacy, "nombre": legacy.capitalize()}
+
+# --- SINCRONIZACIÓN ---
+
+@app.get("/sync/{usuario}")
+async def sync_all(usuario: str, x_api_key: str = Header(None)):
+    verify_key(x_api_key)
+    
+    data_path = resolve_data_path(usuario)
+    
+    ref_usuario = db.reference(f'/usuarios/{data_path}')
+    datos_usuario = ref_usuario.get() or {}
+    
+    mi_perfil = {
+        "rutina_actual": datos_usuario.get("rutina_actual", {}),
+        "historial": datos_usuario.get("historial", {})
+    }
+    
+    amigos = {}
+    all_users = get_all_registered_users()
+    
+    for user_info in all_users:
+        friend_path = user_info["data_path"]
+        if friend_path != data_path:
+            ref_amigo = db.reference(f'/usuarios/{friend_path}')
+            datos_amigo = ref_amigo.get() or {}
+            amigos[user_info["nombre"]] = {
+                "rutina_actual": datos_amigo.get("rutina_actual", {}),
+                "historial": datos_amigo.get("historial", {})
+            }
+    
+    first_friend = next(iter(amigos.values()), {"rutina_actual": {}, "historial": {}})
+    
+    return {
+        "mi_perfil": mi_perfil,
+        "amigos": amigos,
+        "perfil_amigo": first_friend
+    }
+
+# --- RUTINA ---
+
+@app.post("/{usuario}/definir_rutina")
+async def set_routine(usuario: str, payload: UpdateRutinaRequest, x_api_key: str = Header(None)):
+    verify_key(x_api_key)
+    data_path = resolve_data_path(usuario)
+    
+    ref = db.reference(f'/usuarios/{data_path}/rutina_actual')
+    datos_dict = {k: v.dict() for k, v in payload.dias.items()}
+    ref.update(datos_dict)
+
+    return {"status": "success", "message": "Plantilla de rutina actualizada"}
+
+# --- GUARDAR DÍA ---
+
+@app.post("/{usuario}/guardar_dia")
+async def save_day(usuario: str, payload: LogDiaRequest, x_api_key: str = Header(None)):
+    verify_key(x_api_key)
+    data_path = resolve_data_path(usuario)
+
+    ref = db.reference(f'/usuarios/{data_path}/historial/{payload.fecha}')
+    ref.set(payload.datos)
+
+    return {
+        "status": "success", 
+        "message": f"Día {payload.fecha} guardado exitosamente"
+    }
+
+# --- BORRAR ---
+
+@app.delete("/{usuario}/historial/{fecha}")
+async def delete_history_day(usuario: str, fecha: str, x_api_key: str = Header(None)):
+    verify_key(x_api_key)
+    data_path = resolve_data_path(usuario)
+    
+    ref = db.reference(f'/usuarios/{data_path}/historial/{fecha}')
+    ref.delete()
+    
+    return {"status": "deleted", "target": f"Historial {fecha}"}
+
+@app.delete("/{usuario}/rutina/{dia_semana}")
+async def delete_routine_day(usuario: str, dia_semana: str, x_api_key: str = Header(None)):
+    verify_key(x_api_key)
+    data_path = resolve_data_path(usuario)
+    
+    ref = db.reference(f'/usuarios/{data_path}/rutina_actual/{dia_semana}')
+    ref.delete()
+    
+    return {"status": "deleted", "target": f"Plantilla {dia_semana}"}
+
+# --- REGISTROS PREVIOS ---
+
 @app.post("/{usuario}/registros_previos")
 async def get_previous_records(usuario: str, payload: PreviousRecordsRequest, x_api_key: str = Header(None)):
     verify_key(x_api_key)
+    data_path = resolve_data_path(usuario)
 
-    ref = db.reference(f'/usuarios/{usuario}/historial')
+    ref = db.reference(f'/usuarios/{data_path}/historial')
     historial = ref.get() or {}
 
     try:
