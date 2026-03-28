@@ -63,6 +63,9 @@ class ClaimLegacyRequest(BaseModel):
     telefono: str
     legacy_username: str
 
+class VerifyPhoneRequest(BaseModel):
+    telefono: str
+
 class PreviousRecordsRequest(BaseModel):
     exercise_names: List[str]
     before_date: str
@@ -167,6 +170,27 @@ async def register_user(payload: RegisterUserRequest, x_api_key: str = Header(No
     })
     
     return {"status": "success", "usuario_id": phone, "data_path": phone, "nombre": nombre}
+
+@app.post("/verificar_telefono")
+async def verify_phone(payload: VerifyPhoneRequest, x_api_key: str = Header(None)):
+    verify_key(x_api_key)
+    phone = sanitize_phone(payload.telefono)
+    
+    if not phone:
+        raise HTTPException(status_code=400, detail="Teléfono es obligatorio")
+    
+    reg_ref = db.reference(f'/users_registry/{phone}')
+    user_data = reg_ref.get()
+    
+    if user_data:
+        return {
+            "status": "found",
+            "nombre": user_data.get("nombre", ""),
+            "data_path": user_data.get("data_path", phone),
+            "telefono": phone
+        }
+    else:
+        return {"status": "not_found"}
 
 @app.post("/reclamar_legacy")
 async def claim_legacy(payload: ClaimLegacyRequest, x_api_key: str = Header(None)):
