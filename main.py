@@ -71,6 +71,11 @@ class PreviousRecordsRequest(BaseModel):
     before_date: str
     days_back: int = 14
 
+class PrivacySettingsRequest(BaseModel):
+    show_body_weight: bool = True
+    show_notes: bool = True
+    show_exercise_details: bool = True
+
 # --- SEGURIDAD ---
 
 def verify_key(x_api_key: str):
@@ -224,6 +229,62 @@ async def claim_legacy(payload: ClaimLegacyRequest, x_api_key: str = Header(None
 
 # --- SINCRONIZACIÓN ---
 
+@app.get("/{usuario}/privacy_settings")
+async def get_privacy_settings(usuario: str, x_api_key: str = Header(None)):
+    verify_key(x_api_key)
+    phone = sanitize_phone(usuario)
+    reg = db.reference(f'/users_registry/{phone}').get()
+    if not reg:
+        return {"status": "success", "settings": {"show_body_weight": True, "show_notes": True, "show_exercise_details": True}}
+    settings = reg.get("privacy_settings", {"show_body_weight": True, "show_notes": True, "show_exercise_details": True})
+    return {"status": "success", "settings": settings}
+
+@app.post("/{usuario}/privacy_settings")
+async def set_privacy_settings(usuario: str, payload: PrivacySettingsRequest, x_api_key: str = Header(None)):
+    verify_key(x_api_key)
+    phone = sanitize_phone(usuario)
+    reg_ref = db.reference(f'/users_registry/{phone}')
+    reg = reg_ref.get()
+    if not reg:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    reg_ref.child("privacy_settings").set({
+        "show_body_weight": payload.show_body_weight,
+        "show_notes": payload.show_notes,
+        "show_exercise_details": payload.show_exercise_details
+    })
+    return {"status": "success", "message": "Ajustes de privacidad actualizados"}
+
+def apply_privacy_filter(historial: dict, privacy: dict) -> dict:
+    """Filtra el historial de un amigo según sus ajustes de privacidad"""
+    if not historial or not privacy:
+        return historial
+    
+    show_body = privacy.get("show_body_weight", True)
+    show_notes = privacy.get("show_notes", True)
+    show_details = privacy.get("show_exercise_details", True)
+    
+    if show_body and show_notes and show_details:
+        return historial
+    
+    filtered = {}
+    for fecha, datos in historial.items():
+        if not isinstance(datos, dict):
+            filtered[fecha] = datos
+            continue
+        day = dict(datos)
+        resumen = day.get("resumen_dia", {})
+        if isinstance(resumen, dict):
+            resumen = dict(resumen)
+            if not show_body:
+                resumen.pop("peso_corporal", None)
+            if not show_notes:
+                resumen.pop("notas_generales", None)
+            day["resumen_dia"] = resumen
+        if not show_details:
+            day.pop("rutina_realizada", None)
+        filtered[fecha] = day
+    return filtered
+
 @app.get("/sync/{usuario}")
 async def sync_all(usuario: str, x_api_key: str = Header(None)):
     verify_key(x_api_key)
@@ -240,15 +301,26 @@ async def sync_all(usuario: str, x_api_key: str = Header(None)):
     
     amigos = {}
     all_users = get_all_registered_users()
+    registry = db.reference('/users_registry').get() or {}
     
     for user_info in all_users:
         friend_path = user_info["data_path"]
         if friend_path != data_path:
             ref_amigo = db.reference(f'/usuarios/{friend_path}')
             datos_amigo = ref_amigo.get() or {}
+            
+            # Buscar ajustes de privacidad del amigo
+            friend_phone = user_info.get("telefono", "")
+            friend_privacy = {}
+            if friend_phone and friend_phone in registry:
+                friend_privacy = registry[friend_phone].get("privacy_settings", {})
+            
+            friend_historial = datos_amigo.get("historial", {})
+            filtered_historial = apply_privacy_filter(friend_historial, friend_privacy)
+            
             amigos[user_info["nombre"]] = {
                 "rutina_actual": datos_amigo.get("rutina_actual", {}),
-                "historial": datos_amigo.get("historial", {})
+                "historial": filtered_historial
             }
     
     first_friend = next(iter(amigos.values()), {"rutina_actual": {}, "historial": {}})
