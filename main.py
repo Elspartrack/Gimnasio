@@ -1,5 +1,7 @@
 import os
 import json
+import hashlib
+import secrets
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
 from fastapi import FastAPI, HTTPException, Header, Body
@@ -58,13 +60,30 @@ class LogDiaRequest(BaseModel):
 class RegisterUserRequest(BaseModel):
     telefono: str
     nombre: str
+    password: Optional[str] = None
+    country_code: Optional[str] = None
 
 class ClaimLegacyRequest(BaseModel):
     telefono: str
     legacy_username: str
+    country_code: Optional[str] = None
+    password: Optional[str] = None
 
 class VerifyPhoneRequest(BaseModel):
     telefono: str
+    password: Optional[str] = None
+
+class SetPasswordRequest(BaseModel):
+    telefono: str
+    password: str
+
+class SetCountryCodeRequest(BaseModel):
+    telefono: str
+    country_code: str
+
+class AdminResetPasswordRequest(BaseModel):
+    telefono: str
+    admin_key: str
 
 class PreviousRecordsRequest(BaseModel):
     exercise_names: List[str]
@@ -76,6 +95,11 @@ class PrivacySettingsRequest(BaseModel):
     show_notes: bool = True
     show_exercise_details: bool = True
 
+class ChangePasswordRequest(BaseModel):
+    telefono: str
+    old_password: str
+    new_password: str
+
 # --- SEGURIDAD ---
 
 def verify_key(x_api_key: str):
@@ -84,6 +108,23 @@ def verify_key(x_api_key: str):
         raise HTTPException(status_code=500, detail="Error de config: API_KEY no establecida en el servidor")
     if x_api_key != env_key:
         raise HTTPException(status_code=403, detail="Acceso denegado: Clave incorrecta")
+
+# --- PASSWORD HELPERS ---
+
+def hash_password(password: str) -> str:
+    """Hash password with PBKDF2-SHA256 + random salt"""
+    salt = secrets.token_hex(16)
+    h = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt.encode('utf-8'), 100000).hex()
+    return f"{salt}${h}"
+
+def verify_password(password: str, stored_hash: str) -> bool:
+    """Verify password against stored PBKDF2 hash"""
+    try:
+        salt, expected = stored_hash.split('$', 1)
+        computed = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt.encode('utf-8'), 100000).hex()
+        return secrets.compare_digest(computed, expected)
+    except Exception:
+        return False
 
 # --- HELPERS ---
 
@@ -163,18 +204,33 @@ async def register_user(payload: RegisterUserRequest, x_api_key: str = Header(No
     if reg_ref.get():
         raise HTTPException(status_code=400, detail="Este teléfono ya está registrado")
     
-    reg_ref.set({
+    user_data = {
         "nombre": nombre,
         "telefono": phone,
         "data_path": phone
-    })
+    }
+    
+    if payload.password:
+        user_data["password_hash"] = hash_password(payload.password)
+    
+    if payload.country_code:
+        user_data["country_code"] = payload.country_code
+    
+    reg_ref.set(user_data)
     
     db.reference(f'/usuarios/{phone}').set({
         "rutina_actual": {},
         "historial": {}
     })
     
-    return {"status": "success", "usuario_id": phone, "data_path": phone, "nombre": nombre}
+    return {
+        "status": "success",
+        "usuario_id": phone,
+        "data_path": phone,
+        "nombre": nombre,
+        "has_password": bool(payload.password),
+        "country_code": payload.country_code or ""
+    }
 
 @app.post("/verificar_telefono")
 async def verify_phone(payload: VerifyPhoneRequest, x_api_key: str = Header(None)):
@@ -188,11 +244,23 @@ async def verify_phone(payload: VerifyPhoneRequest, x_api_key: str = Header(None
     user_data = reg_ref.get()
     
     if user_data:
+        has_password = bool(user_data.get("password_hash"))
+        has_country_code = bool(user_data.get("country_code"))
+        
+        # If client sent password and user has one, verify it
+        if payload.password and has_password:
+            if not verify_password(payload.password, user_data["password_hash"]):
+                raise HTTPException(status_code=401, detail="Contraseña incorrecta")
+        
         return {
             "status": "found",
             "nombre": user_data.get("nombre", ""),
             "data_path": user_data.get("data_path", phone),
-            "telefono": phone
+            "telefono": phone,
+            "has_password": has_password,
+            "needs_password_setup": not has_password,
+            "country_code": user_data.get("country_code", ""),
+            "needs_country_code": not has_country_code
         }
     else:
         return {"status": "not_found"}
@@ -222,10 +290,23 @@ async def claim_legacy(payload: ClaimLegacyRequest, x_api_key: str = Header(None
         "nombre": legacy.capitalize(),
         "telefono": phone,
         "data_path": legacy,
-        "legacy_username": legacy
+        "legacy_username": legacy,
+        **({
+            "country_code": payload.country_code
+        } if payload.country_code else {}),
+        **({
+            "password_hash": hash_password(payload.password)
+        } if payload.password else {})
     })
     
-    return {"status": "success", "usuario_id": phone, "data_path": legacy, "nombre": legacy.capitalize()}
+    return {
+        "status": "success",
+        "usuario_id": phone,
+        "data_path": legacy,
+        "nombre": legacy.capitalize(),
+        "has_password": bool(payload.password),
+        "country_code": payload.country_code or ""
+    }
 
 # --- SINCRONIZACIÓN ---
 
@@ -325,10 +406,20 @@ async def sync_all(usuario: str, x_api_key: str = Header(None)):
     
     first_friend = next(iter(amigos.values()), {"rutina_actual": {}, "historial": {}})
     
+    # Build user metadata for v3 clients
+    user_reg = db.reference(f'/users_registry/{usuario}').get() or {}
+    user_meta = {
+        "has_password": bool(user_reg.get("password_hash")),
+        "needs_password_setup": not bool(user_reg.get("password_hash")),
+        "country_code": user_reg.get("country_code", ""),
+        "needs_country_code": not bool(user_reg.get("country_code"))
+    }
+    
     return {
         "mi_perfil": mi_perfil,
         "amigos": amigos,
-        "perfil_amigo": first_friend
+        "perfil_amigo": first_friend,
+        "user_meta": user_meta
     }
 
 # --- RUTINA ---
@@ -450,3 +541,95 @@ async def get_previous_records(usuario: str, payload: PreviousRecordsRequest, x_
             }
 
     return {"status": "success", "records": results}
+
+# --- SEGURIDAD DE CUENTAS (v3) ---
+
+@app.post("/establecer_password")
+async def set_password(payload: SetPasswordRequest, x_api_key: str = Header(None)):
+    """Establecer contraseña para usuario existente"""
+    verify_key(x_api_key)
+    phone = sanitize_phone(payload.telefono)
+    
+    if not phone or not payload.password:
+        raise HTTPException(status_code=400, detail="Teléfono y contraseña son obligatorios")
+    
+    if len(payload.password) < 4:
+        raise HTTPException(status_code=400, detail="La contraseña debe tener al menos 4 caracteres")
+    
+    reg_ref = db.reference(f'/users_registry/{phone}')
+    reg = reg_ref.get()
+    
+    if not reg:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    
+    reg_ref.child("password_hash").set(hash_password(payload.password))
+    
+    return {"status": "success", "message": "Contraseña establecida"}
+
+@app.post("/cambiar_password")
+async def change_password(payload: ChangePasswordRequest, x_api_key: str = Header(None)):
+    """Cambiar contraseña (requiere contraseña actual)"""
+    verify_key(x_api_key)
+    phone = sanitize_phone(payload.telefono)
+    
+    if not phone:
+        raise HTTPException(status_code=400, detail="Teléfono es obligatorio")
+    
+    if len(payload.new_password) < 4:
+        raise HTTPException(status_code=400, detail="La nueva contraseña debe tener al menos 4 caracteres")
+    
+    reg_ref = db.reference(f'/users_registry/{phone}')
+    reg = reg_ref.get()
+    
+    if not reg:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    
+    stored_hash = reg.get("password_hash")
+    if not stored_hash:
+        raise HTTPException(status_code=400, detail="No tienes contraseña configurada. Usa establecer_password.")
+    
+    if not verify_password(payload.old_password, stored_hash):
+        raise HTTPException(status_code=401, detail="Contraseña actual incorrecta")
+    
+    reg_ref.child("password_hash").set(hash_password(payload.new_password))
+    
+    return {"status": "success", "message": "Contraseña cambiada exitosamente"}
+
+@app.post("/establecer_prefijo")
+async def set_country_code(payload: SetCountryCodeRequest, x_api_key: str = Header(None)):
+    """Establecer prefijo telefónico para usuario existente"""
+    verify_key(x_api_key)
+    phone = sanitize_phone(payload.telefono)
+    
+    if not phone or not payload.country_code:
+        raise HTTPException(status_code=400, detail="Teléfono y prefijo son obligatorios")
+    
+    reg_ref = db.reference(f'/users_registry/{phone}')
+    reg = reg_ref.get()
+    
+    if not reg:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    
+    reg_ref.child("country_code").set(payload.country_code)
+    
+    return {"status": "success", "message": "Prefijo actualizado"}
+
+@app.post("/admin/reset_password")
+async def admin_reset_password(payload: AdminResetPasswordRequest, x_api_key: str = Header(None)):
+    """Admin: resetear contraseña de un usuario (contactar con Enrique)"""
+    verify_key(x_api_key)
+    
+    admin_key = os.getenv("ADMIN_KEY", "gymbros_admin_enrique_2024")
+    if payload.admin_key != admin_key:
+        raise HTTPException(status_code=403, detail="Clave de administrador incorrecta")
+    
+    phone = sanitize_phone(payload.telefono)
+    reg_ref = db.reference(f'/users_registry/{phone}')
+    reg = reg_ref.get()
+    
+    if not reg:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    
+    reg_ref.child("password_hash").delete()
+    
+    return {"status": "success", "message": "Contraseña reseteada. El usuario deberá establecer una nueva."}
