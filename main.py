@@ -45,6 +45,8 @@ class EjercicioPlantilla(BaseModel):
     descanso_objetivo: Optional[str] = ""
     notas_default: Optional[str] = ""
     tipo_medida: Optional[str] = "reps"
+    primary_muscles: Optional[List[str]] = None
+    secondary_muscles: Optional[List[str]] = None
 
 class DiaRutina(BaseModel):
     dia_semana: str 
