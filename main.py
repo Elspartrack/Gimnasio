@@ -102,6 +102,10 @@ class ChangePasswordRequest(BaseModel):
     old_password: str
     new_password: str
 
+class SetThemeRequest(BaseModel):
+    telefono: str
+    theme_color: str
+
 # --- SEGURIDAD ---
 
 def verify_key(x_api_key: str):
@@ -262,7 +266,8 @@ async def verify_phone(payload: VerifyPhoneRequest, x_api_key: str = Header(None
             "has_password": has_password,
             "needs_password_setup": not has_password,
             "country_code": user_data.get("country_code", ""),
-            "needs_country_code": not has_country_code
+            "needs_country_code": not has_country_code,
+            "theme_color": user_data.get("theme_color", "")
         }
     else:
         return {"status": "not_found"}
@@ -635,3 +640,27 @@ async def admin_reset_password(payload: AdminResetPasswordRequest, x_api_key: st
     reg_ref.child("password_hash").delete()
     
     return {"status": "success", "message": "Contraseña reseteada. El usuario deberá establecer una nueva."}
+
+@app.post("/establecer_tema")
+async def set_theme(payload: SetThemeRequest, x_api_key: str = Header(None)):
+    """Establecer color de tema preferido del usuario (orange/blue/green/purple/red)"""
+    verify_key(x_api_key)
+    phone = sanitize_phone(payload.telefono)
+    
+    if not phone:
+        raise HTTPException(status_code=400, detail="Teléfono es obligatorio")
+    
+    valid_themes = {"orange", "blue", "green", "purple", "red"}
+    theme = (payload.theme_color or "").lower().strip()
+    if theme not in valid_themes:
+        raise HTTPException(status_code=400, detail=f"Tema inválido. Permitidos: {sorted(valid_themes)}")
+    
+    reg_ref = db.reference(f'/users_registry/{phone}')
+    reg = reg_ref.get()
+    
+    if not reg:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    
+    reg_ref.child("theme_color").set(theme)
+    
+    return {"status": "success", "theme_color": theme}
