@@ -5,6 +5,7 @@ import secrets
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
 from fastapi import FastAPI, HTTPException, Header, Body
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 import firebase_admin
 from firebase_admin import credentials, db
@@ -188,6 +189,11 @@ def home():
 @app.get("/ping")
 def keep_alive():
     return {"status": "alive", "message": "Server is running"}
+
+@app.get("/ai_model", response_class=PlainTextResponse)
+def get_ai_model(x_api_key: str = Header(None)):
+    verify_key(x_api_key)
+    return os.getenv("GEMINI_MODEL", "gemma-4-31b-it")
 
 # --- GESTIÓN DE USUARIOS ---
 
